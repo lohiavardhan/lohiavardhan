@@ -10,21 +10,6 @@ query userInfo($login: String!) {{
   user(login: $login) {{
     name
     login
-    commits: contributionsCollection(from: "{datetime.now().year}-01-01T00:00:00Z") {{
-      totalCommitContributions
-    }}
-    repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {{
-      totalCount
-    }}
-    pullRequests(first: 1) {{
-      totalCount
-    }}
-    openIssues: issues(states: OPEN) {{
-      totalCount
-    }}
-    closedIssues: issues(states: CLOSED) {{
-      totalCount
-    }}
     followers {{
       totalCount
     }}
@@ -78,7 +63,7 @@ query userInfo($login: String!) {
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
     languages = get_languages(username, token)
-    lines = get_lines_of_code(username, token)
+    lines, commits, contributed_to = get_lines_of_code(username, token)
 
     with open(path, "w", encoding="utf-8") as readme:
         readme.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
@@ -87,8 +72,8 @@ def generate_readme(username: str, token: str, path: str = "README.md"):
 
         readme.write("## 📊 stats\n")
         readme.write("```\n")
-        readme.write(f"commits (ytd):         {stats['commits']}\n")
-        readme.write(f"contributed to:        {stats['contributed_to']} repos\n")
+        readme.write(f"commits (all time):    {commits:,}\n")
+        readme.write(f"contributed to:        {contributed_to} repos\n")
         readme.write(f"lines of code written: {lines:,}\n")
         readme.write("```\n\n")
 
@@ -121,12 +106,6 @@ def get_stats(username: str, token: str):
     for repository in data["repositories"]["nodes"]:
         stars += repository["stargazers"]["totalCount"]
     stats["stars"] = stars
-
-    stats["commits"] = data["commits"]["totalCommitContributions"]
-    stats["prs"] = data["pullRequests"]["totalCount"]
-    stats["contributed_to"] = data["repositoriesContributedTo"]["totalCount"]
-    stats["open_issues"] = data["openIssues"]["totalCount"]
-    stats["closed_issues"] = data["closedIssues"]["totalCount"]
     stats["followers"] = data["followers"]["totalCount"]
 
     return stats
@@ -155,7 +134,9 @@ def get_languages(username: str, token: str):
             lang_size = edge["size"]
             languages[lang_name] = languages.get(lang_name, 0) + lang_size
 
+    # merge Jupyter Notebook into Python
     languages["Python"] = languages.get("Python", 0) + languages.pop("Jupyter Notebook", 0)
+
     sorted_languages = dict(
         sorted(languages.items(), key=lambda pair: pair[1], reverse=True)
     )
@@ -169,13 +150,15 @@ def get_lines_of_code(username: str, token: str):
         "Content-Type": "application/json",
     }
 
-    # Get repo list via GraphQL (works with any valid token)
     payload = {"query": REPOS_QUERY, "variables": {"login": username}}
     response = requests.post(graphql_url, json=payload, headers=headers)
     response.raise_for_status()
     repos = response.json()["data"]["user"]["repositories"]["nodes"]
 
     total_lines = 0
+    total_commits = 0
+    contributed_to = 0
+
     for repo in repos:
         repo_name = repo["nameWithOwner"]
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
@@ -187,13 +170,15 @@ def get_lines_of_code(username: str, token: str):
                 if isinstance(contributors, list):
                     for contributor in contributors:
                         if contributor.get("author", {}).get("login", "").lower() == username.lower():
+                            contributed_to += 1
                             for week in contributor.get("weeks", []):
                                 total_lines += week.get("a", 0)
+                                total_commits += week.get("c", 0)
                 break
             elif r.status_code == 202:
                 time.sleep(2)
 
-    return total_lines
+    return total_lines, total_commits, contributed_to
 
 
 def percent_bar(percent: float, width: int = 20):
