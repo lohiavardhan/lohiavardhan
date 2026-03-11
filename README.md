@@ -1,10 +1,17 @@
-# hi, i'm vardhan, i write code
+> last updated: 11 Mar 2026, 06:35 UTC
 
-> last updated: 11 Mar 2026, 06:25 UTC
+# i'm vardhan, i write code 
 
 ---
 
-## top languages
+## 📊 stats
+```
+commits (ytd):         23
+contributed to:        1 repos
+lines of code written: 0
+```
+
+## 💻 top languages
 ```
 JavaScript   [███████░░░░░░░░░░░░░] 34.80%
 Python       [███░░░░░░░░░░░░░░░░░] 15.91%
