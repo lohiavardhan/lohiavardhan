@@ -65,13 +65,21 @@ query userInfo($login: String!) {
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
     languages = get_languages(username, token)
+    lines = get_lines_of_code(username, token)
 
     with open(path, "w", encoding="utf-8") as readme:
-        readme.write(f"# hi, i'm vardhan, i write code\n\n")
         readme.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
+        readme.write(f"# i'm vardhan, i write code \n\n")
         readme.write("---\n\n")
 
-        readme.write("## top languages\n")
+        readme.write("## 📊 stats\n")
+        readme.write("```\n")
+        readme.write(f"commits (ytd):   {stats['commits']}\n")
+        readme.write(f"contributed to:  {stats['contributed_to']} repos\n")
+        readme.write(f"lines of code written:   {lines:,}\n")
+        readme.write("```\n\n")
+
+        readme.write("## 💻 top languages\n")
         readme.write("```\n")
         total_size = sum(size for _, size in languages.items())
         for lang, size in list(languages.items())[:10]:
@@ -141,7 +149,42 @@ def get_languages(username: str, token: str):
     return sorted_languages
 
 
-def percent_bar(percent: float, width: int = 20):
+def get_lines_of_code(username: str, token: str):
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    # Get all repos owned by the user
+    repos_url = f"https://api.github.com/user/repos?affiliation=owner&per_page=100"
+    response = requests.get(repos_url, headers=headers)
+    response.raise_for_status()
+    repos = response.json()
+
+    total_lines = 0
+    for repo in repos:
+        repo_name = repo["full_name"]
+        stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
+
+        # GitHub may return 202 while it computes stats, retry a couple times
+        for _ in range(3):
+            r = requests.get(stats_url, headers=headers)
+            if r.status_code == 200:
+                contributors = r.json()
+                if isinstance(contributors, list):
+                    for contributor in contributors:
+                        if contributor.get("author", {}).get("login", "").lower() == username.lower():
+                            for week in contributor.get("weeks", []):
+                                total_lines += week.get("a", 0)
+                break
+            elif r.status_code == 202:
+                import time
+                time.sleep(2)
+
+    return total_lines
+
+
+(percent: float, width: int = 20):
     percent = max(0, min(100, percent))
     filled = round((percent / 100) * width)
     empty = width - filled
