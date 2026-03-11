@@ -155,6 +155,7 @@ def get_languages(username: str, token: str):
             lang_size = edge["size"]
             languages[lang_name] = languages.get(lang_name, 0) + lang_size
 
+    languages["Python"] = languages.get("Python", 0) + languages.pop("Jupyter Notebook", 0)
     sorted_languages = dict(
         sorted(languages.items(), key=lambda pair: pair[1], reverse=True)
     )
