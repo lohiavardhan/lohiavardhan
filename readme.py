@@ -222,23 +222,26 @@ def get_all_time_commits(username: str, token: str):
     return total_commits
 
 def get_all_time_contributed_to(username: str, token: str):
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
+    # get all repos you own (includes private via PAT)
+    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
+    response = requests.post(graphql_url, json=payload, headers=headers)
+    response.raise_for_status()
+    owned_repos = {node["nameWithOwner"] for node in response.json()["data"]["user"]["repositories"]["nodes"]}
+
+    # get join year
     joined_query = """
     query userInfo($login: String!) {
-      user(login: $login) {
-        createdAt
-      }
+      user(login: $login) { createdAt }
     }
     """
     response = requests.post(graphql_url, json={"query": joined_query, "variables": {"login": username}}, headers=headers)
     response.raise_for_status()
     join_year = int(response.json()["data"]["user"]["createdAt"][:4])
 
-    repos = set()
+    # get public repos you contributed to but don't own
+    external_repos = set()
     for year in range(join_year, datetime.now().year + 1):
         from_date = f"{year}-01-01T00:00:00Z"
         to_date = f"{year}-12-31T23:59:59Z"
@@ -246,10 +249,8 @@ def get_all_time_contributed_to(username: str, token: str):
         query userInfo($login: String!) {{
           user(login: $login) {{
             contributionsCollection(from: "{from_date}", to: "{to_date}") {{
-              commitContributionsByRepository {{
-                repository {{
-                  nameWithOwner
-                }}
+              commitContributionsByRepository(maxRepositories: 100) {{
+                repository {{ nameWithOwner }}
               }}
             }}
           }}
@@ -259,9 +260,11 @@ def get_all_time_contributed_to(username: str, token: str):
         r.raise_for_status()
         contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
         for contrib in contribs:
-            repos.add(contrib["repository"]["nameWithOwner"])
+            name = contrib["repository"]["nameWithOwner"]
+            if name not in owned_repos:
+                external_repos.add(name)
 
-    return len(repos)
+    return len(owned_repos) + len(external_repos)
 
 def percent_bar(percent: float, width: int = 20):
     percent = max(0, min(100, percent))
