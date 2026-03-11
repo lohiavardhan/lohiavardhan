@@ -1,16 +1,19 @@
-## Hi there 👋
+# hi, i'm vardhan, i write code
 
-<!--
-**lohiavardhan/lohiavardhan** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+> last updated: 11 Mar 2026, 06:23 UTC
 
-Here are some ideas to get you started:
+---
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+## top languages
+```
+JavaScript   [███████░░░░░░░░░░░░░] 34.80%
+Python       [███░░░░░░░░░░░░░░░░░] 15.91%
+HTML         [███░░░░░░░░░░░░░░░░░] 15.50%
+Dart         [███░░░░░░░░░░░░░░░░░] 13.61%
+CSS          [██░░░░░░░░░░░░░░░░░░] 11.10%
+C++          [█░░░░░░░░░░░░░░░░░░░] 3.27%
+Lua          [░░░░░░░░░░░░░░░░░░░░] 1.96%
+CMake        [░░░░░░░░░░░░░░░░░░░░] 1.54%
+Solidity     [░░░░░░░░░░░░░░░░░░░░] 1.14%
+C            [░░░░░░░░░░░░░░░░░░░░] 0.42%
+```
