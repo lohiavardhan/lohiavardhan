@@ -184,7 +184,7 @@ def get_lines_of_code(username: str, token: str):
     return total_lines
 
 
-(percent: float, width: int = 20):
+def percent_bar(percent: float, width: int = 20):
     percent = max(0, min(100, percent))
     filled = round((percent / 100) * width)
     empty = width - filled
