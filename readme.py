@@ -63,7 +63,10 @@ query userInfo($login: String!) {
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
     languages = get_languages(username, token)
-    lines, commits, contributed_to = get_lines_of_code(username, token)
+    lines = get_lines_of_code(username, token)
+    commits = get_all_time_commits(username, token)
+    contributed_to = get_all_time_contributed_to(username, token)
+
 
     with open(path, "w", encoding="utf-8") as readme:
         readme.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
@@ -156,8 +159,6 @@ def get_lines_of_code(username: str, token: str):
     repos = response.json()["data"]["user"]["repositories"]["nodes"]
 
     total_lines = 0
-    total_commits = 0
-    contributed_to = 0
 
     for repo in repos:
         repo_name = repo["nameWithOwner"]
@@ -170,16 +171,97 @@ def get_lines_of_code(username: str, token: str):
                 if isinstance(contributors, list):
                     for contributor in contributors:
                         if contributor.get("author", {}).get("login", "").lower() == username.lower():
-                            contributed_to += 1
                             for week in contributor.get("weeks", []):
                                 total_lines += week.get("a", 0)
-                                total_commits += week.get("c", 0)
                 break
             elif r.status_code == 202:
                 time.sleep(2)
 
-    return total_lines, total_commits, contributed_to
+    return total_lines
 
+def get_all_time_commits(username: str, token: str):
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    # First get the year the user joined
+    joined_query = """
+    query userInfo($login: String!) {
+      user(login: $login) {
+        createdAt
+      }
+    }
+    """
+    response = requests.post(graphql_url, json={"query": joined_query, "variables": {"login": username}}, headers=headers)
+    response.raise_for_status()
+    created_at = response.json()["data"]["user"]["createdAt"]
+    join_year = int(created_at[:4])
+
+    # Query each year from join year to now
+    total_commits = 0
+    for year in range(join_year, datetime.now().year + 1):
+        from_date = f"{year}-01-01T00:00:00Z"
+        to_date = f"{year}-12-31T23:59:59Z"
+        query = f"""
+        query userInfo($login: String!) {{
+          user(login: $login) {{
+            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
+              totalCommitContributions
+              restrictedContributionsCount
+            }}
+          }}
+        }}
+        """
+        r = requests.post(graphql_url, json={"query": query, "variables": {"login": username}}, headers=headers)
+        r.raise_for_status()
+        data = r.json()["data"]["user"]["contributionsCollection"]
+        # totalCommitContributions = public, restrictedContributionsCount = private
+        total_commits += data["totalCommitContributions"] + data["restrictedContributionsCount"]
+
+    return total_commits
+
+def get_all_time_contributed_to(username: str, token: str):
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    joined_query = """
+    query userInfo($login: String!) {
+      user(login: $login) {
+        createdAt
+      }
+    }
+    """
+    response = requests.post(graphql_url, json={"query": joined_query, "variables": {"login": username}}, headers=headers)
+    response.raise_for_status()
+    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
+
+    repos = set()
+    for year in range(join_year, datetime.now().year + 1):
+        from_date = f"{year}-01-01T00:00:00Z"
+        to_date = f"{year}-12-31T23:59:59Z"
+        query = f"""
+        query userInfo($login: String!) {{
+          user(login: $login) {{
+            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
+              commitContributionsByRepository {{
+                repository {{
+                  nameWithOwner
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
+        r = requests.post(graphql_url, json={"query": query, "variables": {"login": username}}, headers=headers)
+        r.raise_for_status()
+        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
+        for contrib in contribs:
+            repos.add(contrib["repository"]["nameWithOwner"])
+
+    return len(repos)
 
 def percent_bar(percent: float, width: int = 20):
     percent = max(0, min(100, percent))
