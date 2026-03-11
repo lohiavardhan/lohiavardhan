@@ -1,5 +1,6 @@
 from datetime import datetime
 import os
+import time
 import requests
 
 graphql_url = "https://api.github.com/graphql"
@@ -61,6 +62,18 @@ query userInfo($login: String!) {
 }
 """
 
+REPOS_QUERY = """
+query userInfo($login: String!) {
+  user(login: $login) {
+    repositories(first: 100, ownerAffiliations: OWNER) {
+      nodes {
+        nameWithOwner
+      }
+    }
+  }
+}
+"""
+
 
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
@@ -74,9 +87,9 @@ def generate_readme(username: str, token: str, path: str = "README.md"):
 
         readme.write("## 📊 stats\n")
         readme.write("```\n")
-        readme.write(f"commits (ytd):   {stats['commits']}\n")
-        readme.write(f"contributed to:  {stats['contributed_to']} repos\n")
-        readme.write(f"lines of code written:   {lines:,}\n")
+        readme.write(f"commits (ytd):         {stats['commits']}\n")
+        readme.write(f"contributed to:        {stats['contributed_to']} repos\n")
+        readme.write(f"lines of code written: {lines:,}\n")
         readme.write("```\n\n")
 
         readme.write("## 💻 top languages\n")
@@ -155,18 +168,17 @@ def get_lines_of_code(username: str, token: str):
         "Content-Type": "application/json",
     }
 
-    # Get all repos owned by the user
-    repos_url = f"https://api.github.com/user/repos?affiliation=owner&per_page=100"
-    response = requests.get(repos_url, headers=headers)
+    # Get repo list via GraphQL (works with any valid token)
+    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
+    response = requests.post(graphql_url, json=payload, headers=headers)
     response.raise_for_status()
-    repos = response.json()
+    repos = response.json()["data"]["user"]["repositories"]["nodes"]
 
     total_lines = 0
     for repo in repos:
-        repo_name = repo["full_name"]
+        repo_name = repo["nameWithOwner"]
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
 
-        # GitHub may return 202 while it computes stats, retry a couple times
         for _ in range(3):
             r = requests.get(stats_url, headers=headers)
             if r.status_code == 200:
@@ -178,7 +190,6 @@ def get_lines_of_code(username: str, token: str):
                                 total_lines += week.get("a", 0)
                 break
             elif r.status_code == 202:
-                import time
                 time.sleep(2)
 
     return total_lines
