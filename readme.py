@@ -72,7 +72,7 @@ def generate_readme(username: str, token: str, path: str = "README.md"):
 
         readme.write("## 📊 stats\n")
         readme.write("```\n")
-        readme.write(f"commits (all time):    {commits:,}\n")
+        readme.write(f"commits:               {commits:,}\n")
         readme.write(f"contributed to:        {contributed_to} repos\n")
         readme.write(f"lines of code written: {lines:,}\n")
         readme.write("```\n\n")
