@@ -60,27 +60,6 @@ query userInfo($login: String!) {
 """
 
 
-def make_request(method: str, url: str, headers: dict, retries: int = 5, backoff: float = 2.0, **kwargs):
-    """Make an HTTP request with exponential backoff retry on 5xx errors."""
-    for attempt in range(retries):
-        if method == "post":
-            response = requests.post(url, headers=headers, **kwargs)
-        else:
-            response = requests.get(url, headers=headers, **kwargs)
-
-        if response.status_code < 500:
-            response.raise_for_status()
-            return response
-
-        wait = backoff * (2 ** attempt)
-        print(f"  [{response.status_code}] Retrying in {wait:.0f}s (attempt {attempt + 1}/{retries})...")
-        time.sleep(wait)
-
-    # Final attempt — let it raise naturally
-    response.raise_for_status()
-    return response
-
-
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
     languages = get_languages(username, token)
