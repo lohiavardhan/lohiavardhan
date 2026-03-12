@@ -266,7 +266,38 @@ def percent_bar(percent: float, width: int = 20):
     return f"[{'█' * filled}{'░' * empty}]"
 
 
+def make_request(method: str, url: str, headers: dict, retries: int = 5, backoff: float = 2.0, **kwargs):
+    """Make an HTTP request with exponential backoff retry on 5xx and rate-limit errors."""
+    for attempt in range(retries):
+        if method == "post":
+            response = requests.post(url, headers=headers, **kwargs)
+        else:
+            response = requests.get(url, headers=headers, **kwargs)
+
+        # Rate limited — back off and retry
+        if response.status_code in (403, 429):
+            body = response.json() if response.content else {}
+            if "rate limit" in body.get("message", "").lower():
+                wait = backoff * (2 ** attempt)
+                print(f"  [rate limit] Retrying in {wait:.0f}s (attempt {attempt + 1}/{retries})...")
+                time.sleep(wait)
+                continue
+
+        if response.status_code < 500:
+            response.raise_for_status()
+            return response
+
+        wait = backoff * (2 ** attempt)
+        print(f"  [{response.status_code}] Retrying in {wait:.0f}s (attempt {attempt + 1}/{retries})...")
+        time.sleep(wait)
+
+    response.raise_for_status()
+    return response
+
+
 if __name__ == "__main__":
     username = "lohiavardhan"
-    token = os.getenv("GITHUB_TOKEN", "")
+    token = os.getenv("GH_PAT", "")
+    if not token:
+        raise RuntimeError("GH_PAT is not set — requests will be unauthenticated and rate-limited.")
     generate_readme(username, token)
