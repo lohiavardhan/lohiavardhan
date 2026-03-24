@@ -1,13 +1,9 @@
 from datetime import datetime
-import json
 import os
 import time
 import requests
 
 graphql_url = "https://api.github.com/graphql"
-
-LOC_CACHE_FILE = "loc_cache.json"
-LOC_CACHE_MAX_AGE_DAYS = 7
 
 STATS_QUERY = f"""
 query userInfo($login: String!) {{
@@ -181,15 +177,7 @@ def get_languages(username: str, token: str):
 
 
 def get_lines_of_code(username: str, token: str, all_repos: set):
-    """Count lines of code across all repos. Uses a local JSON cache that
-    expires after LOC_CACHE_MAX_AGE_DAYS to avoid re-fetching every run."""
-
-    # Check cache
-    cached = load_loc_cache()
-    if cached is not None:
-        print(f"  [cache] Using cached LOC value: {cached:,}")
-        return cached
-
+    """Count lines of code across all repos (owned + external)."""
     headers = {
         "Authorization": f"token {token}",
         "Content-Type": "application/json",
@@ -200,7 +188,7 @@ def get_lines_of_code(username: str, token: str, all_repos: set):
     for repo_name in all_repos:
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
 
-        for attempt in range(3):  # reduced from 6 to 3
+        for attempt in range(3):
             r = make_request("get", stats_url, headers=headers)
             if r.status_code == 200:
                 contributors = r.json()
@@ -216,31 +204,7 @@ def get_lines_of_code(username: str, token: str, all_repos: set):
                 print(f"  [202] Stats not ready for {repo_name}, retrying in {wait}s...")
                 time.sleep(wait)
 
-    save_loc_cache(total_lines)
     return total_lines
-
-
-def load_loc_cache():
-    """Load cached LOC value if the cache file exists and is less than
-    LOC_CACHE_MAX_AGE_DAYS old. Returns the cached int or None."""
-    if not os.path.exists(LOC_CACHE_FILE):
-        return None
-    try:
-        with open(LOC_CACHE_FILE, "r") as f:
-            data = json.load(f)
-        cached_date = datetime.fromisoformat(data["date"])
-        if (datetime.now() - cached_date).days < LOC_CACHE_MAX_AGE_DAYS:
-            return data["lines"]
-    except (json.JSONDecodeError, KeyError, ValueError):
-        pass
-    return None
-
-
-def save_loc_cache(lines: int):
-    """Persist the LOC count with a timestamp."""
-    with open(LOC_CACHE_FILE, "w") as f:
-        json.dump({"lines": lines, "date": datetime.now().isoformat()}, f)
-    print(f"  [cache] Saved LOC cache: {lines:,}")
 
 
 def get_all_time_commits(username: str, token: str):

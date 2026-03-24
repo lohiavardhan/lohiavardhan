@@ -1,5 +1,4 @@
 name: Update README
-
 on:
   schedule:
     - cron: "0 */12 * * *"
@@ -7,36 +6,24 @@ on:
   push:
     branches:
       - main
-
 jobs:
   update-readme:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-
+        uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
-      
-      - name: Cache LOC data
-        uses: actions/cache@v4
-        with:
-          path: loc_cache.json
-          key: loc-cache
-
       - name: Generate README
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: python readme.py
-
       - name: Commit README changes
         run: |
           git config user.name "github-actions[bot]"
