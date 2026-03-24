@@ -321,4 +321,4 @@ if __name__ == "__main__":
     token = os.getenv("GH_PAT", "")
     if not token:
         raise RuntimeError("GH_PAT is not set — requests will be unauthenticated and rate-limited.")
-    generate_readme(username, toke
+    generate_readme(username, token)
