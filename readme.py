@@ -1,9 +1,13 @@
 from datetime import datetime
+import json
 import os
 import time
 import requests
 
 graphql_url = "https://api.github.com/graphql"
+
+LOC_CACHE_FILE = "loc_cache.json"
+LOC_CACHE_MAX_AGE_DAYS = 7
 
 STATS_QUERY = f"""
 query userInfo($login: String!) {{
@@ -63,9 +67,13 @@ query userInfo($login: String!) {
 def generate_readme(username: str, token: str, path: str = "README.md"):
     stats = get_stats(username, token)
     languages = get_languages(username, token)
-    lines = get_lines_of_code(username, token)
+
+    # Shared repo discovery — used by both lines and contributed_to
+    owned_repos, all_repos = discover_all_repos(username, token)
+
+    lines = get_lines_of_code(username, token, all_repos)
     commits = get_all_time_commits(username, token)
-    contributed_to = get_all_time_contributed_to(username, token)
+    contributed_to = len(all_repos)
 
     with open(path, "w", encoding="utf-8") as readme:
         readme.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
@@ -87,6 +95,52 @@ def generate_readme(username: str, token: str, path: str = "README.md"):
             bar = percent_bar(percent)
             readme.write(f"{lang:<12} {bar} {percent:.2f}%\n")
         readme.write("```\n")
+
+
+def discover_all_repos(username: str, token: str):
+    """Return (owned_repo_names, all_repo_names) including external contributions.
+    Called once and shared across functions that need the repo list."""
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    # 1. Owned repos
+    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
+    response = make_request("post", graphql_url, headers=headers, json=payload)
+    owned_repos = {node["nameWithOwner"] for node in response.json()["data"]["user"]["repositories"]["nodes"]}
+
+    # 2. Get join year
+    joined_query = """
+    query userInfo($login: String!) {
+      user(login: $login) { createdAt }
+    }
+    """
+    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
+    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
+
+    # 3. Discover external repos across all years
+    all_repos = set(owned_repos)
+    for year in range(join_year, datetime.now().year + 1):
+        from_date = f"{year}-01-01T00:00:00Z"
+        to_date = f"{year}-12-31T23:59:59Z"
+        query = f"""
+        query userInfo($login: String!) {{
+          user(login: $login) {{
+            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
+              commitContributionsByRepository(maxRepositories: 100) {{
+                repository {{ nameWithOwner }}
+              }}
+            }}
+          }}
+        }}
+        """
+        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
+        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
+        for contrib in contribs:
+            all_repos.add(contrib["repository"]["nameWithOwner"])
+
+    return owned_repos, all_repos
 
 
 def get_stats(username: str, token: str):
@@ -126,53 +180,27 @@ def get_languages(username: str, token: str):
     return dict(sorted(languages.items(), key=lambda pair: pair[1], reverse=True))
 
 
-def get_lines_of_code(username: str, token: str):
+def get_lines_of_code(username: str, token: str, all_repos: set):
+    """Count lines of code across all repos. Uses a local JSON cache that
+    expires after LOC_CACHE_MAX_AGE_DAYS to avoid re-fetching every run."""
+
+    # Check cache
+    cached = load_loc_cache()
+    if cached is not None:
+        print(f"  [cache] Using cached LOC value: {cached:,}")
+        return cached
+
     headers = {
         "Authorization": f"token {token}",
         "Content-Type": "application/json",
     }
 
-    # 1. Get owned repos
-    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
-    response = make_request("post", graphql_url, headers=headers, json=payload)
-    owned_repos = response.json()["data"]["user"]["repositories"]["nodes"]
-    all_repo_names = {repo["nameWithOwner"] for repo in owned_repos}
-
-    # 2. Discover external repos contributed to (across all years)
-    joined_query = """
-    query userInfo($login: String!) {
-      user(login: $login) { createdAt }
-    }
-    """
-    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
-    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
-
-    for year in range(join_year, datetime.now().year + 1):
-        from_date = f"{year}-01-01T00:00:00Z"
-        to_date = f"{year}-12-31T23:59:59Z"
-        query = f"""
-        query userInfo($login: String!) {{
-          user(login: $login) {{
-            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
-              commitContributionsByRepository(maxRepositories: 100) {{
-                repository {{ nameWithOwner }}
-              }}
-            }}
-          }}
-        }}
-        """
-        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
-        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
-        for contrib in contribs:
-            all_repo_names.add(contrib["repository"]["nameWithOwner"])
-
-    # 3. Count lines added across all repos (owned + external)
     total_lines = 0
 
-    for repo_name in all_repo_names:
+    for repo_name in all_repos:
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
 
-        for attempt in range(6):
+        for attempt in range(3):  # reduced from 6 to 3
             r = make_request("get", stats_url, headers=headers)
             if r.status_code == 200:
                 contributors = r.json()
@@ -188,7 +216,31 @@ def get_lines_of_code(username: str, token: str):
                 print(f"  [202] Stats not ready for {repo_name}, retrying in {wait}s...")
                 time.sleep(wait)
 
+    save_loc_cache(total_lines)
     return total_lines
+
+
+def load_loc_cache():
+    """Load cached LOC value if the cache file exists and is less than
+    LOC_CACHE_MAX_AGE_DAYS old. Returns the cached int or None."""
+    if not os.path.exists(LOC_CACHE_FILE):
+        return None
+    try:
+        with open(LOC_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        cached_date = datetime.fromisoformat(data["date"])
+        if (datetime.now() - cached_date).days < LOC_CACHE_MAX_AGE_DAYS:
+            return data["lines"]
+    except (json.JSONDecodeError, KeyError, ValueError):
+        pass
+    return None
+
+
+def save_loc_cache(lines: int):
+    """Persist the LOC count with a timestamp."""
+    with open(LOC_CACHE_FILE, "w") as f:
+        json.dump({"lines": lines, "date": datetime.now().isoformat()}, f)
+    print(f"  [cache] Saved LOC cache: {lines:,}")
 
 
 def get_all_time_commits(username: str, token: str):
@@ -226,46 +278,6 @@ def get_all_time_commits(username: str, token: str):
         total_commits += data["totalCommitContributions"] + data["restrictedContributionsCount"]
 
     return total_commits
-
-
-def get_all_time_contributed_to(username: str, token: str):
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-
-    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
-    response = make_request("post", graphql_url, headers=headers, json=payload)
-    owned_repos = {node["nameWithOwner"] for node in response.json()["data"]["user"]["repositories"]["nodes"]}
-
-    joined_query = """
-    query userInfo($login: String!) {
-      user(login: $login) { createdAt }
-    }
-    """
-    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
-    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
-
-    external_repos = set()
-    for year in range(join_year, datetime.now().year + 1):
-        from_date = f"{year}-01-01T00:00:00Z"
-        to_date = f"{year}-12-31T23:59:59Z"
-        query = f"""
-        query userInfo($login: String!) {{
-          user(login: $login) {{
-            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
-              commitContributionsByRepository(maxRepositories: 100) {{
-                repository {{ nameWithOwner }}
-              }}
-            }}
-          }}
-        }}
-        """
-        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
-        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
-        for contrib in contribs:
-            name = contrib["repository"]["nameWithOwner"]
-            if name not in owned_repos:
-                external_repos.add(name)
-
-    return len(owned_repos) + len(external_repos)
 
 
 def percent_bar(percent: float, width: int = 20):
@@ -309,4 +321,4 @@ if __name__ == "__main__":
     token = os.getenv("GH_PAT", "")
     if not token:
         raise RuntimeError("GH_PAT is not set — requests will be unauthenticated and rate-limited.")
-    generate_readme(username, token)
+    generate_readme(username, toke
