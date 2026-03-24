@@ -29,7 +29,7 @@ query userInfo($login: String!) {{
 LANGUAGES_QUERY = """
 query userInfo($login: String!) {
   user(login: $login) {
-    repositories(ownerAffiliations: OWNER, isFork: false, first: 100) {
+    repositories(ownerAffiliations: OWNER, first: 100) {
       nodes {
         name
         languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
@@ -132,14 +132,44 @@ def get_lines_of_code(username: str, token: str):
         "Content-Type": "application/json",
     }
 
+    # 1. Get owned repos
     payload = {"query": REPOS_QUERY, "variables": {"login": username}}
     response = make_request("post", graphql_url, headers=headers, json=payload)
-    repos = response.json()["data"]["user"]["repositories"]["nodes"]
+    owned_repos = response.json()["data"]["user"]["repositories"]["nodes"]
+    all_repo_names = {repo["nameWithOwner"] for repo in owned_repos}
 
+    # 2. Discover external repos contributed to (across all years)
+    joined_query = """
+    query userInfo($login: String!) {
+      user(login: $login) { createdAt }
+    }
+    """
+    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
+    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
+
+    for year in range(join_year, datetime.now().year + 1):
+        from_date = f"{year}-01-01T00:00:00Z"
+        to_date = f"{year}-12-31T23:59:59Z"
+        query = f"""
+        query userInfo($login: String!) {{
+          user(login: $login) {{
+            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
+              commitContributionsByRepository(maxRepositories: 100) {{
+                repository {{ nameWithOwner }}
+              }}
+            }}
+          }}
+        }}
+        """
+        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
+        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
+        for contrib in contribs:
+            all_repo_names.add(contrib["repository"]["nameWithOwner"])
+
+    # 3. Count lines added across all repos (owned + external)
     total_lines = 0
 
-    for repo in repos:
-        repo_name = repo["nameWithOwner"]
+    for repo_name in all_repo_names:
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
 
         for attempt in range(6):
