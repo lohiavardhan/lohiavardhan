@@ -9,17 +9,23 @@ on:
 jobs:
   update-readme:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write   # ← required to delete caches
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
+
       - name: Restore LOC cache
         uses: actions/cache@v4
         with:
@@ -27,10 +33,12 @@ jobs:
           key: loc-cache-${{ github.run_number }}
           restore-keys: |
             loc-cache-
+
       - name: Generate README
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: python readme.py
+
       - name: Commit README changes
         run: |
           git config user.name "github-actions[bot]"
@@ -38,3 +46,12 @@ jobs:
           git add README.md
           git commit -m "chore: update README" || echo "No changes to commit"
           git push || echo "No changes to push"
+
+      - name: Delete old caches  # ← new step
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_KEY="loc-cache-${{ github.run_number }}"
+          gh cache list --key "loc-cache-" --json id,key \
+            --jq ".[] | select(.key != \"$CURRENT_KEY\") | .id" \
+            | xargs -r -I{} gh cache delete {}
