@@ -1,9 +1,12 @@
 from datetime import datetime
+import json
 import os
 import time
 import requests
 
 graphql_url = "https://api.github.com/graphql"
+
+LOC_CACHE_FILE = "loc_cache.json"
 
 STATS_QUERY = f"""
 query userInfo($login: String!) {{
@@ -58,6 +61,23 @@ query userInfo($login: String!) {
   }
 }
 """
+
+
+def load_loc_cache():
+    """Load per-repo LOC cache from disk. Returns a dict of {repo_name: lines}."""
+    if not os.path.exists(LOC_CACHE_FILE):
+        return {}
+    try:
+        with open(LOC_CACHE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_loc_cache(cache: dict):
+    """Persist per-repo LOC cache to disk."""
+    with open(LOC_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 
 def generate_readme(username: str, token: str, path: str = "README.md"):
@@ -177,32 +197,57 @@ def get_languages(username: str, token: str):
 
 
 def get_lines_of_code(username: str, token: str, all_repos: set):
-    """Count lines of code across all repos (owned + external)."""
+    """Count lines of code across all repos (owned + external).
+    Uses a per-repo cache: fresh data when GitHub returns 200,
+    cached fallback when GitHub returns 202 (stats not ready)."""
     headers = {
         "Authorization": f"token {token}",
         "Content-Type": "application/json",
     }
 
+    cache = load_loc_cache()
     total_lines = 0
+    fresh = 0
+    cached = 0
 
     for repo_name in all_repos:
         stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
+        repo_lines = None
 
         for attempt in range(3):
             r = make_request("get", stats_url, headers=headers)
             if r.status_code == 200:
                 contributors = r.json()
                 if isinstance(contributors, list):
+                    repo_lines = 0
                     for contributor in contributors:
                         if contributor.get("author", {}).get("login", "").lower() == username.lower():
                             for week in contributor.get("weeks", []):
-                                total_lines += week.get("a", 0)
+                                repo_lines += week.get("a", 0)
+                    # Update cache with fresh data
+                    cache[repo_name] = repo_lines
+                    fresh += 1
                 break
             elif r.status_code == 202:
-                # GitHub is computing stats — wait and retry
                 wait = 2 * (2 ** attempt)
                 print(f"  [202] Stats not ready for {repo_name}, retrying in {wait}s...")
                 time.sleep(wait)
+
+        # If we never got a 200, fall back to cache
+        if repo_lines is None:
+            if repo_name in cache:
+                repo_lines = cache[repo_name]
+                cached += 1
+                print(f"  [cache] Using cached LOC for {repo_name}: {repo_lines:,}")
+            else:
+                repo_lines = 0
+                print(f"  [miss] No data for {repo_name}, counting as 0")
+
+        total_lines += repo_lines
+
+    save_loc_cache(cache)
+    print(f"\n  LOC summary: {fresh} fresh, {cached} from cache, {len(all_repos) - fresh - cached} missed")
+    print(f"  Total lines: {total_lines:,}")
 
     return total_lines
 
