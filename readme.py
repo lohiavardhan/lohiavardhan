@@ -1,32 +1,30 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import time
 import requests
 
-graphql_url = "https://api.github.com/graphql"
+GRAPHQL_URL = "https://api.github.com/graphql"
+STATE_FILE = "state.json"
+INCREMENTAL_WINDOW_HOURS = 12
 
-LOC_CACHE_FILE = "loc_cache.json"
+# ─── GraphQL Queries ──────────────────────────────────────────────────────────
 
-STATS_QUERY = f"""
-query userInfo($login: String!) {{
-  user(login: $login) {{
+STATS_QUERY = """
+query userInfo($login: String!) {
+  user(login: $login) {
     name
     login
-    followers {{
+    followers { totalCount }
+    repositories(first: 100, ownerAffiliations: OWNER) {
       totalCount
-    }}
-    repositories(first: 100, ownerAffiliations: OWNER) {{
-      totalCount
-      nodes {{
+      nodes {
         name
-        stargazers {{
-          totalCount
-        }}
-      }}
-    }}
-  }}
-}}
+        stargazers { totalCount }
+      }
+    }
+  }
+}
 """
 
 LANGUAGES_QUERY = """
@@ -38,10 +36,7 @@ query userInfo($login: String!) {
         languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
           edges {
             size
-            node {
-              color
-              name
-            }
+            node { color name }
           }
         }
       }
@@ -54,133 +49,284 @@ REPOS_QUERY = """
 query userInfo($login: String!) {
   user(login: $login) {
     repositories(first: 100, ownerAffiliations: OWNER) {
-      nodes {
-        nameWithOwner
-      }
+      nodes { nameWithOwner }
     }
   }
 }
 """
 
+JOIN_YEAR_QUERY = """
+query userInfo($login: String!) {
+  user(login: $login) { createdAt }
+}
+"""
 
-def load_loc_cache():
-    """Load per-repo LOC cache from disk. Returns a dict of {repo_name: lines}."""
-    if not os.path.exists(LOC_CACHE_FILE):
-        return {}
+
+# ─── State Management ─────────────────────────────────────────────────────────
+
+def load_state() -> dict | None:
+    if not os.path.exists(STATE_FILE):
+        return None
     try:
-        with open(LOC_CACHE_FILE, "r") as f:
+        with open(STATE_FILE, "r") as f:
             return json.load(f)
     except (json.JSONDecodeError, ValueError):
-        return {}
+        return None
 
 
-def save_loc_cache(cache: dict):
-    """Persist per-repo LOC cache to disk."""
-    with open(LOC_CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=2)
+def save_state(state: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
-def generate_readme(username: str, token: str, path: str = "README.md"):
-    stats = get_stats(username, token)
-    languages = get_languages(username, token)
-
-    # Shared repo discovery — used by both lines and contributed_to
-    owned_repos, all_repos = discover_all_repos(username, token)
-
-    lines = get_lines_of_code(username, token, all_repos)
-    commits = get_all_time_commits(username, token)
-    contributed_to = len(all_repos)
-
-    with open(path, "w", encoding="utf-8") as readme:
-        readme.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
-        readme.write(f"# i'm vardhan, i write code \n\n")
-        readme.write("---\n\n")
-
-        readme.write("## 📊 stats\n")
-        readme.write("```\n")
-        readme.write(f"commits:               {commits:,}\n")
-        readme.write(f"contributed to:        {contributed_to} repos\n")
-        readme.write(f"lines of code written: {lines:,}\n")
-        readme.write("```\n\n")
-
-        readme.write("## 💻 top languages\n")
-        readme.write("```\n")
-        total_size = sum(size for _, size in languages.items())
-        for lang, size in list(languages.items())[:10]:
-            percent = (size / total_size) * 100 if total_size > 0 else 0
-            bar = percent_bar(percent)
-            readme.write(f"{lang:<12} {bar} {percent:.2f}%\n")
-        readme.write("```\n")
+def should_run_incremental(state: dict | None) -> bool:
+    """Incremental if we have a valid prior state."""
+    if state is None or not state.get("initialized"):
+        return False
+    return True
 
 
-def discover_all_repos(username: str, token: str):
-    """Return (owned_repo_names, all_repo_names) including external contributions.
-    Called once and shared across functions that need the repo list."""
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    }
+# ─── Shared Helpers ────────────────────────────────────────────────────────────
 
-    # 1. Owned repos
-    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
-    response = make_request("post", graphql_url, headers=headers, json=payload)
-    owned_repos = {node["nameWithOwner"] for node in response.json()["data"]["user"]["repositories"]["nodes"]}
+def get_join_year(username: str, headers: dict) -> int:
+    r = make_request("post", GRAPHQL_URL, headers=headers,
+                     json={"query": JOIN_YEAR_QUERY, "variables": {"login": username}})
+    return int(r.json()["data"]["user"]["createdAt"][:4])
 
-    # 2. Get join year
-    joined_query = """
-    query userInfo($login: String!) {
-      user(login: $login) { createdAt }
-    }
+
+def get_commits_in_range(username: str, headers: dict, from_iso: str, to_iso: str) -> int:
+    """Get total commits (public + private) in a date range."""
+    query = f"""
+    query userInfo($login: String!) {{
+      user(login: $login) {{
+        contributionsCollection(from: "{from_iso}", to: "{to_iso}") {{
+          totalCommitContributions
+          restrictedContributionsCount
+        }}
+      }}
+    }}
     """
-    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
-    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
+    r = make_request("post", GRAPHQL_URL, headers=headers,
+                     json={"query": query, "variables": {"login": username}})
+    data = r.json()["data"]["user"]["contributionsCollection"]
+    return data["totalCommitContributions"] + data["restrictedContributionsCount"]
 
-    # 3. Discover external repos across all years
-    all_repos = set(owned_repos)
-    for year in range(join_year, datetime.now().year + 1):
-        from_date = f"{year}-01-01T00:00:00Z"
-        to_date = f"{year}-12-31T23:59:59Z"
-        query = f"""
-        query userInfo($login: String!) {{
-          user(login: $login) {{
-            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
-              commitContributionsByRepository(maxRepositories: 100) {{
-                repository {{ nameWithOwner }}
-              }}
-            }}
+
+def get_repos_in_range(username: str, headers: dict, from_iso: str, to_iso: str) -> set:
+    """Discover repos contributed to in a date range."""
+    query = f"""
+    query userInfo($login: String!) {{
+      user(login: $login) {{
+        contributionsCollection(from: "{from_iso}", to: "{to_iso}") {{
+          commitContributionsByRepository(maxRepositories: 100) {{
+            repository {{ nameWithOwner }}
           }}
         }}
-        """
-        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
-        contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
-        for contrib in contribs:
-            all_repos.add(contrib["repository"]["nameWithOwner"])
+      }}
+    }}
+    """
+    r = make_request("post", GRAPHQL_URL, headers=headers,
+                     json={"query": query, "variables": {"login": username}})
+    contribs = r.json()["data"]["user"]["contributionsCollection"]["commitContributionsByRepository"]
+    return {c["repository"]["nameWithOwner"] for c in contribs}
 
-    return owned_repos, all_repos
+
+def fetch_repo_loc(username: str, headers: dict, repo_name: str) -> int | None:
+    """Fetch lines added by the user in a single repo. Returns None if stats aren't ready."""
+    stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
+    for attempt in range(3):
+        r = make_request("get", stats_url, headers=headers)
+        if r.status_code == 200:
+            contributors = r.json()
+            if isinstance(contributors, list):
+                lines = 0
+                for contributor in contributors:
+                    if contributor.get("author", {}).get("login", "").lower() == username.lower():
+                        for week in contributor.get("weeks", []):
+                            lines += week.get("a", 0)
+                return lines
+            return 0
+        elif r.status_code == 202:
+            wait = 2 * (2 ** attempt)
+            print(f"  [202] Stats not ready for {repo_name}, retrying in {wait}s...")
+            time.sleep(wait)
+    return None  # never got a 200
 
 
-def get_stats(username: str, token: str):
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
+# ─── Full Run ──────────────────────────────────────────────────────────────────
+
+def full_run(username: str, token: str) -> dict:
+    """First-time run: compute everything from scratch."""
+    print("═══ FULL RUN ═══")
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+    # 1. Discover all repos (owned + external, all years)
+    print("▸ Discovering repos...")
+    payload = {"query": REPOS_QUERY, "variables": {"login": username}}
+    r = make_request("post", GRAPHQL_URL, headers=headers, json=payload)
+    owned_repos = {n["nameWithOwner"] for n in r.json()["data"]["user"]["repositories"]["nodes"]}
+
+    join_year = get_join_year(username, headers)
+    all_repos = set(owned_repos)
+    for year in range(join_year, datetime.now().year + 1):
+        from_d = f"{year}-01-01T00:00:00Z"
+        to_d = f"{year}-12-31T23:59:59Z"
+        all_repos |= get_repos_in_range(username, headers, from_d, to_d)
+    print(f"  Found {len(all_repos)} repos ({len(owned_repos)} owned)")
+
+    # 2. All-time commits (year by year)
+    print("▸ Counting commits...")
+    total_commits = 0
+    for year in range(join_year, datetime.now().year + 1):
+        from_d = f"{year}-01-01T00:00:00Z"
+        to_d = f"{year}-12-31T23:59:59Z"
+        total_commits += get_commits_in_range(username, headers, from_d, to_d)
+    print(f"  Total commits: {total_commits:,}")
+
+    # 3. Lines of code (all repos)
+    print("▸ Counting lines of code...")
+    loc_cache = {}
+    total_loc = 0
+    for repo_name in all_repos:
+        lines = fetch_repo_loc(username, headers, repo_name)
+        if lines is not None:
+            loc_cache[repo_name] = lines
+        else:
+            lines = 0
+            print(f"  [miss] No data for {repo_name}")
+        total_loc += lines
+    print(f"  Total LOC: {total_loc:,}")
+
+    # 4. Languages (cheap, always fetch fresh)
+    languages = get_languages(username, token)
+
+    state = {
+        "initialized": True,
+        "last_run": datetime.now(timezone.utc).isoformat(),
+        "total_commits": total_commits,
+        "total_loc": total_loc,
+        "loc_cache": loc_cache,
+        "all_repos": sorted(all_repos),
+        "languages": languages,
     }
+    save_state(state)
+    return state
 
+
+# ─── Incremental Run ──────────────────────────────────────────────────────────
+
+def incremental_run(username: str, token: str, prev_state: dict) -> dict:
+    """Subsequent runs: only look at the window since last run."""
+    print("═══ INCREMENTAL RUN ═══")
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+    last_run = prev_state["last_run"]
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    last_run_dt = datetime.fromisoformat(last_run)
+    years_to_check = set()
+    years_to_check.add(last_run_dt.year)
+    years_to_check.add(now.year)
+
+    # 1. Incremental commits — only the window years
+    print(f"▸ Commits since {last_run}...")
+    new_total_commits = 0
+    for year in range(min(years_to_check), max(years_to_check) + 1):
+        from_d = f"{year}-01-01T00:00:00Z"
+        to_d = f"{year}-12-31T23:59:59Z"
+        new_total_commits += get_commits_in_range(username, headers, from_d, to_d)
+
+    join_year = get_join_year(username, headers)
+    per_year_commits = prev_state.get("per_year_commits", {})
+
+    for year in years_to_check:
+        from_d = f"{year}-01-01T00:00:00Z"
+        to_d = f"{year}-12-31T23:59:59Z"
+        per_year_commits[str(year)] = get_commits_in_range(username, headers, from_d, to_d)
+
+    total_commits = sum(per_year_commits.values())
+    print(f"  Total commits: {total_commits:,} (refreshed years: {sorted(years_to_check)})")
+
+    # 2. Discover any new repos in the window
+    print("▸ Checking for new repos...")
+    all_repos = set(prev_state["all_repos"])
+    for year in years_to_check:
+        from_d = f"{year}-01-01T00:00:00Z"
+        to_d = f"{year}-12-31T23:59:59Z"
+        all_repos |= get_repos_in_range(username, headers, from_d, to_d)
+
+    new_repos = all_repos - set(prev_state["all_repos"])
+    if new_repos:
+        print(f"  Found {len(new_repos)} new repo(s): {new_repos}")
+
+    # 3. LOC — only re-fetch repos that had recent activity
+    print("▸ Updating LOC for active repos...")
+    loc_cache = dict(prev_state.get("loc_cache", {}))
+    recently_active = get_recently_active_repos(username, headers)
+
+    repos_to_refresh = (recently_active | new_repos) & all_repos
+    print(f"  Refreshing {len(repos_to_refresh)} repo(s)")
+
+    for repo_name in repos_to_refresh:
+        lines = fetch_repo_loc(username, headers, repo_name)
+        if lines is not None:
+            loc_cache[repo_name] = lines
+        elif repo_name not in loc_cache:
+            print(f"  [miss] No data for {repo_name}")
+
+    total_loc = sum(loc_cache.get(r, 0) for r in all_repos)
+    print(f"  Total LOC: {total_loc:,}")
+
+    # 4. Languages (single GraphQL call — always fresh)
+    languages = get_languages(username, token)
+
+    state = {
+        "initialized": True,
+        "last_run": now_iso,
+        "total_commits": total_commits,
+        "per_year_commits": per_year_commits,
+        "total_loc": total_loc,
+        "loc_cache": loc_cache,
+        "all_repos": sorted(all_repos),
+        "languages": languages,
+    }
+    save_state(state)
+    return state
+
+
+def get_recently_active_repos(username: str, headers: dict) -> set:
+    """Use the Events API to find repos the user pushed to recently."""
+    events_url = f"https://api.github.com/users/{username}/events?per_page=100"
+    active = set()
+    try:
+        r = make_request("get", events_url, headers=headers)
+        if r.status_code == 200:
+            for event in r.json():
+                if event.get("type") == "PushEvent":
+                    repo = event.get("repo", {}).get("name")
+                    if repo:
+                        active.add(repo)
+    except Exception:
+        pass  # non-critical — worst case we skip some LOC updates
+    return active
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def get_stats(username: str, token: str) -> dict:
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
     payload = {"query": STATS_QUERY, "variables": {"login": username}}
-    response = make_request("post", graphql_url, headers=headers, json=payload)
+    response = make_request("post", GRAPHQL_URL, headers=headers, json=payload)
     data = response.json()["data"]["user"]
-
     stars = sum(repo["stargazers"]["totalCount"] for repo in data["repositories"]["nodes"])
     return {"stars": stars, "followers": data["followers"]["totalCount"]}
 
 
-def get_languages(username: str, token: str):
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    }
-
+def get_languages(username: str, token: str) -> dict:
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
     payload = {"query": LANGUAGES_QUERY, "variables": {"login": username}}
-    response = make_request("post", graphql_url, headers=headers, json=payload)
+    response = make_request("post", GRAPHQL_URL, headers=headers, json=payload)
     data = response.json()["data"]["user"]["repositories"]["nodes"]
 
     languages = {}
@@ -190,121 +336,23 @@ def get_languages(username: str, token: str):
             lang_size = edge["size"]
             languages[lang_name] = languages.get(lang_name, 0) + lang_size
 
-    # merge Jupyter Notebook into Python
     languages["Python"] = languages.get("Python", 0) + languages.pop("Jupyter Notebook", 0)
-
     return dict(sorted(languages.items(), key=lambda pair: pair[1], reverse=True))
 
 
-def get_lines_of_code(username: str, token: str, all_repos: set):
-    """Count lines of code across all repos (owned + external).
-    Uses a per-repo cache: fresh data when GitHub returns 200,
-    cached fallback when GitHub returns 202 (stats not ready)."""
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    }
-
-    cache = load_loc_cache()
-    total_lines = 0
-    fresh = 0
-    cached = 0
-
-    for repo_name in all_repos:
-        stats_url = f"https://api.github.com/repos/{repo_name}/stats/contributors"
-        repo_lines = None
-
-        for attempt in range(3):
-            r = make_request("get", stats_url, headers=headers)
-            if r.status_code == 200:
-                contributors = r.json()
-                if isinstance(contributors, list):
-                    repo_lines = 0
-                    for contributor in contributors:
-                        if contributor.get("author", {}).get("login", "").lower() == username.lower():
-                            for week in contributor.get("weeks", []):
-                                repo_lines += week.get("a", 0)
-                    # Update cache with fresh data
-                    cache[repo_name] = repo_lines
-                    fresh += 1
-                break
-            elif r.status_code == 202:
-                wait = 2 * (2 ** attempt)
-                print(f"  [202] Stats not ready for {repo_name}, retrying in {wait}s...")
-                time.sleep(wait)
-
-        # If we never got a 200, fall back to cache
-        if repo_lines is None:
-            if repo_name in cache:
-                repo_lines = cache[repo_name]
-                cached += 1
-                print(f"  [cache] Using cached LOC for {repo_name}: {repo_lines:,}")
-            else:
-                repo_lines = 0
-                print(f"  [miss] No data for {repo_name}, counting as 0")
-
-        total_lines += repo_lines
-
-    save_loc_cache(cache)
-    print(f"\n  LOC summary: {fresh} fresh, {cached} from cache, {len(all_repos) - fresh - cached} missed")
-    print(f"  Total lines: {total_lines:,}")
-
-    return total_lines
-
-
-def get_all_time_commits(username: str, token: str):
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    }
-
-    joined_query = """
-    query userInfo($login: String!) {
-      user(login: $login) {
-        createdAt
-      }
-    }
-    """
-    response = make_request("post", graphql_url, headers=headers, json={"query": joined_query, "variables": {"login": username}})
-    join_year = int(response.json()["data"]["user"]["createdAt"][:4])
-
-    total_commits = 0
-    for year in range(join_year, datetime.now().year + 1):
-        from_date = f"{year}-01-01T00:00:00Z"
-        to_date = f"{year}-12-31T23:59:59Z"
-        query = f"""
-        query userInfo($login: String!) {{
-          user(login: $login) {{
-            contributionsCollection(from: "{from_date}", to: "{to_date}") {{
-              totalCommitContributions
-              restrictedContributionsCount
-            }}
-          }}
-        }}
-        """
-        r = make_request("post", graphql_url, headers=headers, json={"query": query, "variables": {"login": username}})
-        data = r.json()["data"]["user"]["contributionsCollection"]
-        total_commits += data["totalCommitContributions"] + data["restrictedContributionsCount"]
-
-    return total_commits
-
-
-def percent_bar(percent: float, width: int = 20):
+def percent_bar(percent: float, width: int = 20) -> str:
     percent = max(0, min(100, percent))
     filled = round((percent / 100) * width)
-    empty = width - filled
-    return f"[{'█' * filled}{'░' * empty}]"
+    return f"[{'█' * filled}{'░' * (width - filled)}]"
 
 
 def make_request(method: str, url: str, headers: dict, retries: int = 5, backoff: float = 2.0, **kwargs):
-    """Make an HTTP request with exponential backoff retry on 5xx and rate-limit errors."""
     for attempt in range(retries):
         if method == "post":
             response = requests.post(url, headers=headers, **kwargs)
         else:
             response = requests.get(url, headers=headers, **kwargs)
 
-        # Rate limited — back off and retry
         if response.status_code in (403, 429):
             body = response.json() if response.content else {}
             if "rate limit" in body.get("message", "").lower():
@@ -314,20 +362,72 @@ def make_request(method: str, url: str, headers: dict, retries: int = 5, backoff
                 continue
 
         if response.status_code < 500:
-            response.raise_for_status()
-            return response
+            return response  # includes 200, 202, 204, etc.
 
         wait = backoff * (2 ** attempt)
         print(f"  [{response.status_code}] Retrying in {wait:.0f}s (attempt {attempt + 1}/{retries})...")
         time.sleep(wait)
 
-    response.raise_for_status()
     return response
 
 
-if __name__ == "__main__":
+# ─── README Writer ─────────────────────────────────────────────────────────────
+
+def write_readme(state: dict, path: str = "README.md"):
+    languages = state["languages"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"> last updated: {datetime.now().strftime('%d %b %Y, %H:%M UTC')}\n\n")
+        f.write("# i'm vardhan, i write code \n\n")
+        f.write("---\n\n")
+
+        f.write("## 📊 stats\n")
+        f.write("```\n")
+        f.write(f"commits:               {state['total_commits']:,}\n")
+        f.write(f"contributed to:        {len(state['all_repos'])} repos\n")
+        f.write(f"lines of code written: {state['total_loc']:,}\n")
+        f.write("```\n\n")
+
+        f.write("## 💻 top languages\n")
+        f.write("```\n")
+        total_size = sum(languages.values())
+        for lang, size in list(languages.items())[:10]:
+            percent = (size / total_size) * 100 if total_size > 0 else 0
+            bar = percent_bar(percent)
+            f.write(f"{lang:<12} {bar} {percent:.2f}%\n")
+        f.write("```\n")
+
+
+# ─── Entrypoint ────────────────────────────────────────────────────────────────
+
+def main():
     username = "lohiavardhan"
     token = os.getenv("GH_PAT", "")
     if not token:
         raise RuntimeError("GH_PAT is not set — requests will be unauthenticated and rate-limited.")
-    generate_readme(username, token)
+
+    prev_state = load_state()
+
+    if should_run_incremental(prev_state):
+        state = incremental_run(username, token, prev_state)
+    else:
+        state = full_run(username, token)
+        # After the first full run, also backfill per-year commits so
+        # incremental runs can replace individual years cleanly.
+        if "per_year_commits" not in state:
+            print("▸ Backfilling per-year commit cache...")
+            headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+            join_year = get_join_year(username, headers)
+            per_year = {}
+            for year in range(join_year, datetime.now().year + 1):
+                from_d = f"{year}-01-01T00:00:00Z"
+                to_d = f"{year}-12-31T23:59:59Z"
+                per_year[str(year)] = get_commits_in_range(username, headers, from_d, to_d)
+            state["per_year_commits"] = per_year
+            save_state(state)
+
+    write_readme(state)
+    print(f"\n✓ README.md updated")
+
+
+if __name__ == "__main__":
+    main()
