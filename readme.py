@@ -186,16 +186,17 @@ def full_run(username: str, token: str) -> dict:
     # 3. Lines of code (all repos)
     print("▸ Counting lines of code...")
     loc_cache = {}
+    loc_missed = []
     total_loc = 0
     for repo_name in all_repos:
         lines = fetch_repo_loc(username, headers, repo_name)
         if lines is not None:
             loc_cache[repo_name] = lines
+            total_loc += lines
         else:
-            lines = 0
+            loc_missed.append(repo_name)
             print(f"  [miss] No data for {repo_name}")
-        total_loc += lines
-    print(f"  Total LOC: {total_loc:,}")
+    print(f"  Total LOC: {total_loc:,} ({len(loc_missed)} repo(s) missed — will retry next run)")
 
     # 4. Languages (cheap, always fetch fresh)
     languages = get_languages(username, token)
@@ -206,6 +207,7 @@ def full_run(username: str, token: str) -> dict:
         "total_commits": total_commits,
         "total_loc": total_loc,
         "loc_cache": loc_cache,
+        "loc_missed": loc_missed,
         "all_repos": sorted(all_repos),
         "languages": languages,
     }
@@ -260,23 +262,31 @@ def incremental_run(username: str, token: str, prev_state: dict) -> dict:
     if new_repos:
         print(f"  Found {len(new_repos)} new repo(s): {new_repos}")
 
-    # 3. LOC — only re-fetch repos that had recent activity
+    # 3. LOC — re-fetch repos with recent activity + retry previously missed repos
     print("▸ Updating LOC for active repos...")
     loc_cache = dict(prev_state.get("loc_cache", {}))
+    prev_missed = set(prev_state.get("loc_missed", []))
     recently_active = get_recently_active_repos(username, headers)
 
-    repos_to_refresh = (recently_active | new_repos) & all_repos
-    print(f"  Refreshing {len(repos_to_refresh)} repo(s)")
+    repos_to_refresh = ((recently_active | new_repos) & all_repos) | prev_missed
+    if prev_missed:
+        print(f"  Retrying {len(prev_missed)} previously missed repo(s)")
+    print(f"  Refreshing {len(repos_to_refresh)} repo(s) total")
 
+    still_missed = []
     for repo_name in repos_to_refresh:
         lines = fetch_repo_loc(username, headers, repo_name)
         if lines is not None:
             loc_cache[repo_name] = lines
-        elif repo_name not in loc_cache:
-            print(f"  [miss] No data for {repo_name}")
+            if repo_name in prev_missed:
+                print(f"  [recovered] {repo_name}: {lines:,} lines")
+        else:
+            still_missed.append(repo_name)
+            if repo_name not in loc_cache:
+                print(f"  [miss] No data for {repo_name}")
 
     total_loc = sum(loc_cache.get(r, 0) for r in all_repos)
-    print(f"  Total LOC: {total_loc:,}")
+    print(f"  Total LOC: {total_loc:,} ({len(still_missed)} repo(s) still missed)")
 
     # 4. Languages (single GraphQL call — always fresh)
     languages = get_languages(username, token)
@@ -288,6 +298,7 @@ def incremental_run(username: str, token: str, prev_state: dict) -> dict:
         "per_year_commits": per_year_commits,
         "total_loc": total_loc,
         "loc_cache": loc_cache,
+        "loc_missed": still_missed,
         "all_repos": sorted(all_repos),
         "languages": languages,
     }
