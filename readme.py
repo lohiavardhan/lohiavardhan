@@ -6,7 +6,6 @@ import requests
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 STATE_FILE = "state.json"
-INCREMENTAL_WINDOW_HOURS = 12
 
 # ─── GraphQL Queries ──────────────────────────────────────────────────────────
 
@@ -82,6 +81,9 @@ def save_state(state: dict):
 def should_run_incremental(state: dict | None) -> bool:
     """Incremental if we have a valid prior state."""
     if state is None or not state.get("initialized"):
+        return False
+    # Guard against a corrupt or missing last_run timestamp
+    if not state.get("last_run"):
         return False
     return True
 
@@ -174,13 +176,14 @@ def full_run(username: str, token: str) -> dict:
         all_repos |= get_repos_in_range(username, headers, from_d, to_d)
     print(f"  Found {len(all_repos)} repos ({len(owned_repos)} owned)")
 
-    # 2. All-time commits (year by year)
+    # 2. All-time commits (year by year), storing per-year for incremental use
     print("▸ Counting commits...")
-    total_commits = 0
+    per_year_commits = {}
     for year in range(join_year, datetime.now().year + 1):
         from_d = f"{year}-01-01T00:00:00Z"
         to_d = f"{year}-12-31T23:59:59Z"
-        total_commits += get_commits_in_range(username, headers, from_d, to_d)
+        per_year_commits[str(year)] = get_commits_in_range(username, headers, from_d, to_d)
+    total_commits = sum(per_year_commits.values())
     print(f"  Total commits: {total_commits:,}")
 
     # 3. Lines of code (all repos)
@@ -205,6 +208,7 @@ def full_run(username: str, token: str) -> dict:
         "initialized": True,
         "last_run": datetime.now(timezone.utc).isoformat(),
         "total_commits": total_commits,
+        "per_year_commits": per_year_commits,
         "total_loc": total_loc,
         "loc_cache": loc_cache,
         "loc_missed": loc_missed,
@@ -218,42 +222,37 @@ def full_run(username: str, token: str) -> dict:
 # ─── Incremental Run ──────────────────────────────────────────────────────────
 
 def incremental_run(username: str, token: str, prev_state: dict) -> dict:
-    """Subsequent runs: only look at the window since last run."""
+    """Subsequent runs: refresh only the window from last_run to now."""
     print("═══ INCREMENTAL RUN ═══")
     headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
     last_run = prev_state["last_run"]
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
-
     last_run_dt = datetime.fromisoformat(last_run)
-    years_to_check = set()
-    years_to_check.add(last_run_dt.year)
-    years_to_check.add(now.year)
+    gap = now - last_run_dt
 
-    # 1. Incremental commits — only the window years
-    print(f"▸ Commits since {last_run}...")
-    new_total_commits = 0
-    for year in range(min(years_to_check), max(years_to_check) + 1):
-        from_d = f"{year}-01-01T00:00:00Z"
-        to_d = f"{year}-12-31T23:59:59Z"
-        new_total_commits += get_commits_in_range(username, headers, from_d, to_d)
+    print(f"  Gap since last run: {gap}")
 
-    join_year = get_join_year(username, headers)
-    per_year_commits = prev_state.get("per_year_commits", {})
+    # Cover every calendar year that overlaps the [last_run, now] window.
+    # Normally just 1 year; 2 if a run crosses a year boundary.
+    years_to_check = set(range(last_run_dt.year, now.year + 1))
+    per_year_commits = dict(prev_state.get("per_year_commits", {}))
 
-    for year in years_to_check:
+    # 1. Refresh commits only for the years in the window
+    print(f"▸ Refreshing commits for {len(years_to_check)} year(s): {sorted(years_to_check)}...")
+    for year in sorted(years_to_check):
         from_d = f"{year}-01-01T00:00:00Z"
         to_d = f"{year}-12-31T23:59:59Z"
         per_year_commits[str(year)] = get_commits_in_range(username, headers, from_d, to_d)
 
     total_commits = sum(per_year_commits.values())
-    print(f"  Total commits: {total_commits:,} (refreshed years: {sorted(years_to_check)})")
+    print(f"  Total commits: {total_commits:,}")
 
-    # 2. Discover any new repos in the window
+    # 2. Discover any new repos across the entire gap
     print("▸ Checking for new repos...")
     all_repos = set(prev_state["all_repos"])
-    for year in years_to_check:
+    for year in sorted(years_to_check):
         from_d = f"{year}-01-01T00:00:00Z"
         to_d = f"{year}-12-31T23:59:59Z"
         all_repos |= get_repos_in_range(username, headers, from_d, to_d)
@@ -422,19 +421,6 @@ def main():
         state = incremental_run(username, token, prev_state)
     else:
         state = full_run(username, token)
-        # After the first full run, also backfill per-year commits so
-        # incremental runs can replace individual years cleanly.
-        if "per_year_commits" not in state:
-            print("▸ Backfilling per-year commit cache...")
-            headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-            join_year = get_join_year(username, headers)
-            per_year = {}
-            for year in range(join_year, datetime.now().year + 1):
-                from_d = f"{year}-01-01T00:00:00Z"
-                to_d = f"{year}-12-31T23:59:59Z"
-                per_year[str(year)] = get_commits_in_range(username, headers, from_d, to_d)
-            state["per_year_commits"] = per_year
-            save_state(state)
 
     write_readme(state)
     print(f"\n✓ README.md updated")
