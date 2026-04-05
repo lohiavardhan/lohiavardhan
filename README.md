@@ -1,4 +1,4 @@
-> last updated: 04 Apr 2026, 12:46 UTC
+> last updated: 05 Apr 2026, 02:05 UTC
 
 # i'm vardhan, i write code 
 
@@ -6,9 +6,9 @@
 
 ## 📊 stats
 ```
-commits:               687
+commits:               692
 contributed to:        25 repos
-lines of code written: 8,385,173
+lines of code written: 9,679,692
 ```
 
 ## 💻 top languages
