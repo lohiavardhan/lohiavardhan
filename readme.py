@@ -6,6 +6,7 @@ import requests
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 STATE_FILE = "state.json"
+excluded_repo = []
 
 # ─── GraphQL Queries ──────────────────────────────────────────────────────────
 
