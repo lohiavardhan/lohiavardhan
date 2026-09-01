@@ -1,4 +1,4 @@
-> last updated: 31 Aug 2026, 18:40 UTC
+> last updated: 01 Sep 2026, 03:16 UTC
 
 # i'm vardhan, i write code 
 
