@@ -1,4 +1,4 @@
-> last updated: 25 Oct 2026, 15:27 UTC
+> last updated: 26 Oct 2026, 02:55 UTC
 
 # i'm vardhan, i write code 
 
@@ -13,8 +13,8 @@ lines of code written: 9,708,684
 
 ## 💻 top languages
 ```
-C            [███████████████████░] 97.29%
-Python       [░░░░░░░░░░░░░░░░░░░░] 1.11%
+C            [███████████████████░] 97.28%
+Python       [░░░░░░░░░░░░░░░░░░░░] 1.12%
 Assembly     [░░░░░░░░░░░░░░░░░░░░] 0.79%
 Shell        [░░░░░░░░░░░░░░░░░░░░] 0.36%
 Makefile     [░░░░░░░░░░░░░░░░░░░░] 0.21%
